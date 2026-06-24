@@ -14,6 +14,9 @@ dependencies = [
 # (macOS: `brew install mysql-client pkg-config`). Install with:
 #   uv sync --extra fast
 fast = ["mysqlclient>=2.2.4"]
+# Snowflake load target (stage + COPY via write_pandas). Install with:
+#   uv sync --extra snowflake
+snowflake = ["snowflake-connector-python[pandas]>=3.7"]
 
 [tool.uv]
 # This is an app, not a library to be built/installed.

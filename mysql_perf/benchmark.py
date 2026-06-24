@@ -1,24 +1,27 @@
 """Stream rows out of MySQL and measure throughput.
 
-The whole point of the PoC: how many rows/second can we pull off the wire?
+The whole point of the PoC: how many rows/second can we pull off the wire — and,
+with a pluggable target, how fast can we extract from MySQL and load elsewhere?
 
 Performance design:
   1. Server-side unbuffered cursor (SSCursor) -> rows stream as we read them;
      the full result set is never materialised client-side.
   2. fetchmany(batch) -> amortises Python-level call overhead over many rows.
-  3. Minimal per-row work -> by default we serialise each row to a tab-
-     separated line and write it to /dev/null (a real-ish consumer doing I/O).
-     `--sink none` skips serialisation entirely to show the raw read ceiling.
+  3. Pluggable target -> rows go to a discard sink (/dev/null or count-only) to
+     measure raw read rate, or to Snowflake to measure extract+load rate.
 
 Examples:
-  uv run python -m mysql_perf.benchmark                    # all rows -> /dev/null
-  uv run python -m mysql_perf.benchmark --sink none        # raw read ceiling
-  uv run python -m mysql_perf.benchmark --driver mysqlclient --limit 2000000
+  uv run python -m mysql_perf.benchmark                          # all rows -> /dev/null
+  uv run python -m mysql_perf.benchmark --sink none              # raw read ceiling
+  uv run python -m mysql_perf.benchmark --driver mysqlclient --compress --repeat 5
+  uv run python -m mysql_perf.benchmark --driver mysqlclient --parallel 8 --sink none
+  uv run python -m mysql_perf.benchmark --driver mysqlclient --compress --target snowflake
 """
 
 from __future__ import annotations
 
 import argparse
+import statistics
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,14 +39,6 @@ def build_query(table: str, columns: str, limit: int) -> str:
     return query
 
 
-def _encode(value) -> bytes:
-    if value is None:
-        return b"\\N"
-    if isinstance(value, bytes):
-        return value
-    return str(value).encode()
-
-
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Stream rows from MySQL and measure throughput.")
     ap.add_argument("--driver", default="pymysql", choices=DRIVERS)
@@ -52,9 +47,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--limit", type=int, default=0, help="max rows; 0 = all")
     ap.add_argument("--batch", type=int, default=10_000, help="fetchmany() size")
     ap.add_argument(
+        "--target",
+        default="discard",
+        choices=["discard", "snowflake"],
+        help="where extracted rows go (default: discard)",
+    )
+    ap.add_argument(
         "--sink",
         default="/dev/null",
-        help="output path for serialised rows; 'none' = count only (raw ceiling); '-' = stdout",
+        help="discard target output: path, 'none' = count only, '-' = stdout",
     )
     ap.add_argument(
         "--progress-every",
@@ -66,6 +67,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--compress",
         action="store_true",
         help="enable MySQL protocol compression (mysqlclient only)",
+    )
+    ap.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="run the benchmark N times and report min/median/max (default: 1)",
     )
     ap.add_argument(
         "--probe",
@@ -86,7 +94,42 @@ def parse_args(argv=None) -> argparse.Namespace:
         default="id",
         help="integer column to range-split on for --parallel (default: id)",
     )
+    # Snowflake target options.
+    ap.add_argument("--sf-table", default="", help="Snowflake target table (default: source --table)")
+    ap.add_argument(
+        "--sf-batch",
+        type=int,
+        default=100_000,
+        help="rows per Snowflake COPY batch (default: 100,000)",
+    )
+    ap.add_argument(
+        "--sf-recreate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="DROP+recreate the Snowflake target table before loading (default: on)",
+    )
     return ap.parse_args(argv)
+
+
+def make_target(args, columns, worker_idx: int | None = None):
+    """Construct the pluggable output target for this run/worker."""
+    if args.target == "snowflake":
+        if worker_idx is not None:
+            raise ValueError("--target snowflake is single-stream only in this version; drop --parallel")
+        from .config import SnowflakeConfig
+        from .targets import SnowflakeTarget
+
+        sf = SnowflakeConfig.from_env()
+        return SnowflakeTarget(
+            sf.connect_kwargs(),
+            args.sf_table or args.table,
+            columns,
+            args.sf_batch,
+            args.sf_recreate,
+        )
+    from .targets import DiscardTarget
+
+    return DiscardTarget(args.sink, worker_idx)
 
 
 def run_probe(conn, n: int) -> int:
@@ -119,43 +162,85 @@ def run_probe(conn, n: int) -> int:
     return 0
 
 
-def _open_worker_sink(sink_arg: str, idx: int):
-    """Per-worker output. /dev/null is shared-safe; regular paths get a .N suffix."""
-    if sink_arg == "none":
-        return None
-    if sink_arg == "-":
-        raise ValueError("--sink - (stdout) is not supported with --parallel; use /dev/null or none")
-    path = sink_arg if sink_arg == "/dev/null" else f"{sink_arg}.{idx}"
-    return open(path, "wb", buffering=1 << 20)
+def run_single(args, cfg) -> float:
+    """One single-stream extraction. Prints a timing breakdown; returns rows/s."""
+    query = build_query(args.table, args.columns, args.limit)
+    dest = f"target={args.target}" + ("" if args.target == "snowflake" else f" sink={args.sink}")
+    print(
+        f"driver={args.driver}  query={query!r}  batch={args.batch:,}  compress={args.compress}  {dest}",
+        file=sys.stderr,
+    )
 
+    t_connect0 = time.perf_counter()
+    conn, ss_cursor = connect(cfg, args.driver, compress=args.compress)
+    connect_s = time.perf_counter() - t_connect0
 
-def _drain(cur, batch: int, sink) -> tuple[int, int]:
-    """Read every row from cur, optionally serialising to sink. Returns (rows, bytes)."""
     rows = 0
-    bytes_out = 0
-    sep, nl = b"\t", b"\n"
-    write = sink.write if sink is not None else None
-    while True:
-        chunk = cur.fetchmany(batch)
-        if not chunk:
-            break
-        if write is not None:
-            blob = nl.join(sep.join(_encode(v) for v in row) for row in chunk) + nl
-            write(blob)
-            bytes_out += len(blob)
-        rows += len(chunk)
-    return rows, bytes_out
+    first_row_s = None  # time from execute() to the first batch arriving
+    target = None
+    t0 = time.perf_counter()
+    last_t, last_rows = t0, 0
+    try:
+        cur = conn.cursor(ss_cursor)
+        cur.arraysize = args.batch
+        cur.execute(query)
+        columns = [d[0] for d in cur.description]
+        target = make_target(args, columns)
+        while True:
+            chunk = cur.fetchmany(args.batch)
+            if not chunk:
+                break
+            if first_row_s is None:
+                first_row_s = time.perf_counter() - t0
+            target.write_batch(chunk)
+            rows += len(chunk)
+
+            if args.progress_every and rows - last_rows >= args.progress_every:
+                now = time.perf_counter()
+                inst = (rows - last_rows) / (now - last_t)
+                avg = rows / (now - t0)
+                print(f"  {rows:,} rows  inst={inst:,.0f}/s  avg={avg:,.0f}/s", end="\r", file=sys.stderr)
+                last_t, last_rows = now, rows
+        cur.close()
+    finally:
+        if target is not None:
+            target.close()
+        conn.close()
+
+    dt = time.perf_counter() - t0
+    rps = rows / dt if dt else 0.0
+    transfer_s = dt - (first_row_s or 0.0)
+    transfer_rps = rows / transfer_s if transfer_s > 0 else 0.0
+
+    print("\n" + "-" * 60, file=sys.stderr)
+    print(f"rows:           {rows:,}", file=sys.stderr)
+    print(f"connect:        {connect_s * 1000:.1f}ms", file=sys.stderr)
+    print(f"time-to-1st-row:{(first_row_s or 0.0) * 1000:.1f}ms  (query submit -> first batch)", file=sys.stderr)
+    print(f"transfer:       {transfer_s:.3f}s", file=sys.stderr)
+    print(f"elapsed:        {dt:.3f}s", file=sys.stderr)
+    print(f"throughput:     {rps:,.0f} rows/s  (transfer-only {transfer_rps:,.0f} rows/s)", file=sys.stderr)
+    if args.target == "snowflake":
+        loaded = getattr(target, "rows_loaded", rows)
+        print(
+            f"snowflake:      loaded {loaded:,} rows into {args.sf_table or args.table}  "
+            f"(extract+load end-to-end, serialised)",
+            file=sys.stderr,
+        )
+    elif getattr(target, "bytes_out", 0):
+        mb = target.bytes_out / (1 << 20)
+        print(f"data out:       {mb:,.1f} MB  ({mb / dt:,.1f} MB/s)", file=sys.stderr)
+    return rps
 
 
 def _stream_shard(idx: int, args, cfg, lo: int, hi: int) -> tuple[int, int, int, float]:
     """Worker: stream one half-open key range [lo, hi) over its own connection.
 
-    Each worker gets a dedicated connection (= dedicated TCP stream), so N
-    workers get ~N independent window/RTT budgets. mysqlclient releases the GIL
-    around its C network calls, so threads genuinely overlap network I/O.
+    Each worker gets a dedicated connection (= dedicated TCP stream). mysqlclient
+    releases the GIL around its C network calls, so threads overlap network I/O.
     """
     conn, ss_cursor = connect(cfg, args.driver, compress=args.compress)
-    sink = _open_worker_sink(args.sink, idx)
+    target = make_target(args, columns=None, worker_idx=idx)
+    rows = 0
     t = time.perf_counter()
     try:
         cur = conn.cursor(ss_cursor)
@@ -164,16 +249,23 @@ def _stream_shard(idx: int, args, cfg, lo: int, hi: int) -> tuple[int, int, int,
             f"SELECT {args.columns} FROM {args.table} "
             f"WHERE {args.shard_key} >= {lo} AND {args.shard_key} < {hi}"
         )
-        rows, bytes_out = _drain(cur, args.batch, sink)
+        while True:
+            chunk = cur.fetchmany(args.batch)
+            if not chunk:
+                break
+            target.write_batch(chunk)
+            rows += len(chunk)
         cur.close()
     finally:
+        target.close()
         conn.close()
-        if sink is not None:
-            sink.close()
-    return idx, rows, bytes_out, time.perf_counter() - t
+    return idx, rows, target.bytes_out, time.perf_counter() - t
 
 
-def run_parallel(args, cfg) -> int:
+def run_parallel(args, cfg) -> float:
+    """N concurrent range scans. Prints per-worker + aggregate stats; returns rows/s."""
+    if args.target == "snowflake":
+        raise ValueError("--target snowflake is single-stream only in this version; drop --parallel")
     n = args.parallel
 
     # Find the key range to split across workers.
@@ -185,7 +277,7 @@ def run_parallel(args, cfg) -> int:
     conn.close()
     if not bounds or bounds[0] is None:
         print("table is empty — nothing to stream", file=sys.stderr)
-        return 1
+        return 0.0
     lo, hi = int(bounds[0]), int(bounds[1])
 
     # Half-open integer ranges [edges[i], edges[i+1]) covering [lo, hi].
@@ -200,10 +292,7 @@ def run_parallel(args, cfg) -> int:
         file=sys.stderr,
     )
     if args.limit:
-        print(
-            "note: --limit is ignored with --parallel (each worker streams its full range)",
-            file=sys.stderr,
-        )
+        print("note: --limit is ignored with --parallel (each worker streams its full range)", file=sys.stderr)
 
     t0 = time.perf_counter()
     results: list[tuple[int, int, int, float]] = []
@@ -228,103 +317,52 @@ def run_parallel(args, cfg) -> int:
     if args.sink != "none":
         mb = total_bytes / (1 << 20)
         print(f"data out:       {mb:,.1f} MB  ({mb / dt:,.1f} MB/s)", file=sys.stderr)
-    verdict = "PASS" if rps >= TARGET_ROWS_PER_SEC else "BELOW TARGET"
-    print(f"target:         {TARGET_ROWS_PER_SEC:,} rows/s  ->  {verdict}", file=sys.stderr)
-    return 0 if rps >= TARGET_ROWS_PER_SEC else 1
+    return rps
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     cfg = DbConfig.from_env()
-    if args.parallel > 1:
-        return run_parallel(args, cfg)
-    query = build_query(args.table, args.columns, args.limit)
-
-    # Resolve the output sink.
-    write = None
-    sink = None
-    count_only = args.sink == "none"
-    if not count_only:
-        sink = sys.stdout.buffer if args.sink == "-" else open(args.sink, "wb", buffering=1 << 20)
-        write = sink.write
-
-    print(
-        f"driver={args.driver}  query={query!r}  batch={args.batch:,}  "
-        f"compress={args.compress}  "
-        f"sink={'none (count only)' if count_only else args.sink}",
-        file=sys.stderr,
-    )
-
-    # Time the connection handshake separately — it's the first sign of latency.
-    t_connect0 = time.perf_counter()
-    conn, ss_cursor = connect(cfg, args.driver, compress=args.compress)
-    connect_s = time.perf_counter() - t_connect0
 
     if args.probe:
+        conn, _ = connect(cfg, args.driver, compress=args.compress)
         return run_probe(conn, args.probe)
 
-    rows = 0
-    bytes_out = 0
-    sep, nl = b"\t", b"\n"
-    first_row_s = None  # time from execute() to the first batch arriving
-
-    t0 = time.perf_counter()
-    last_t, last_rows = t0, 0
+    runner = run_parallel if args.parallel > 1 else run_single
+    n = max(1, args.repeat)
+    rps_list: list[float] = []
     try:
-        cur = conn.cursor(ss_cursor)
-        cur.arraysize = args.batch
-        cur.execute(query)
-        while True:
-            chunk = cur.fetchmany(args.batch)
-            if not chunk:
-                break
-            if first_row_s is None:
-                first_row_s = time.perf_counter() - t0
+        # Validate the target's config up front so a misconfigured destination
+        # fails fast — before we open MySQL connections or start extracting.
+        if args.target == "snowflake":
+            from .config import SnowflakeConfig
 
-            if write is not None:
-                blob = nl.join(sep.join(_encode(v) for v in row) for row in chunk) + nl
-                write(blob)
-                bytes_out += len(blob)
+            SnowflakeConfig.from_env()
+        for i in range(n):
+            if n > 1:
+                print(f"\n===== run {i + 1}/{n} =====", file=sys.stderr)
+            rps_list.append(runner(args, cfg))
+    except (ValueError, ImportError) as exc:
+        # Expected config/usage problems (missing creds, bad flag combo, missing
+        # optional deps) — show a clean message rather than a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-            rows += len(chunk)
+    if n > 1:
+        median = statistics.median(rps_list)
+        print("\n" + "=" * 60, file=sys.stderr)
+        print(
+            f"repeat {n}:      min={min(rps_list):,.0f}  median={median:,.0f}  "
+            f"max={max(rps_list):,.0f} rows/s",
+            file=sys.stderr,
+        )
+        result = median
+    else:
+        result = rps_list[0]
 
-            if args.progress_every and rows - last_rows >= args.progress_every:
-                now = time.perf_counter()
-                inst = (rows - last_rows) / (now - last_t)
-                avg = rows / (now - t0)
-                print(
-                    f"  {rows:,} rows  inst={inst:,.0f}/s  avg={avg:,.0f}/s",
-                    end="\r",
-                    file=sys.stderr,
-                )
-                last_t, last_rows = now, rows
-        cur.close()
-    finally:
-        conn.close()
-        if sink is not None and sink is not sys.stdout.buffer:
-            sink.close()
-
-    dt = time.perf_counter() - t0
-    rps = rows / dt if dt else 0.0
-    # Transfer-only rate excludes connect + time-to-first-row, so it reflects
-    # steady-state streaming throughput rather than fixed startup latency.
-    transfer_s = dt - (first_row_s or 0.0)
-    transfer_rps = rows / transfer_s if transfer_s > 0 else 0.0
-
-    print("\n" + "-" * 60, file=sys.stderr)
-    print(f"rows:           {rows:,}", file=sys.stderr)
-    print(f"connect:        {connect_s * 1000:.1f}ms", file=sys.stderr)
-    print(f"time-to-1st-row:{(first_row_s or 0.0) * 1000:.1f}ms  (query submit -> first batch)", file=sys.stderr)
-    print(f"transfer:       {transfer_s:.3f}s", file=sys.stderr)
-    print(f"elapsed:        {dt:.3f}s", file=sys.stderr)
-    print(f"throughput:     {rps:,.0f} rows/s  (transfer-only {transfer_rps:,.0f} rows/s)", file=sys.stderr)
-    if not count_only:
-        mb = bytes_out / (1 << 20)
-        print(f"data out:       {mb:,.1f} MB  ({mb / dt:,.1f} MB/s)", file=sys.stderr)
-    verdict = "PASS" if rps >= TARGET_ROWS_PER_SEC else "BELOW TARGET"
+    verdict = "PASS" if result >= TARGET_ROWS_PER_SEC else "BELOW TARGET"
     print(f"target:         {TARGET_ROWS_PER_SEC:,} rows/s  ->  {verdict}", file=sys.stderr)
-
-    return 0 if rps >= TARGET_ROWS_PER_SEC else 1
+    return 0 if result >= TARGET_ROWS_PER_SEC else 1
 
 
 if __name__ == "__main__":
