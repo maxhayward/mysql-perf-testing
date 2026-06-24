@@ -1,6 +1,16 @@
 .venv/
 __pycache__/
 *.pyc
-.env
-.mise.local.toml
 uv.lock
+.mise.local.toml
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+# private keys (e.g. Snowflake key-pair)
+/snowflake
+/snowflake.pub
+*.p8
+*.pem
+*.key

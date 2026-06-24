@@ -4,16 +4,16 @@ version = "0.1.0"
 description = "Proof-of-concept: how fast can we stream rows out of MySQL?"
 requires-python = ">=3.12"
 dependencies = [
-    # Pure-Python driver: zero system dependencies, works everywhere.
-    # Provides SSCursor (server-side / unbuffered streaming cursor).
+    # Default fast path: C extension over libmysqlclient (~2x faster parsing).
+    # Needs libmysqlclient at build time (macOS: brew install mysql-client
+    # pkg-config; the mise `mysql` tool also provides mysql_config).
+    "mysqlclient>=2.2.4",
+    # Pure-Python fallback (also used by seed.py). Zero system deps; selected
+    # automatically by --driver auto if the mysqlclient C extension can't load.
     "PyMySQL>=1.1.1",
 ]
 
 [project.optional-dependencies]
-# Faster C-based driver. Needs libmysqlclient at build time
-# (macOS: `brew install mysql-client pkg-config`). Install with:
-#   uv sync --extra fast
-fast = ["mysqlclient>=2.2.4"]
 # Snowflake load target (stage + COPY via write_pandas). Install with:
 #   uv sync --extra snowflake
 snowflake = ["snowflake-connector-python[pandas]>=3.7"]

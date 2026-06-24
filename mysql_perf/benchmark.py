@@ -27,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import TABLE, DbConfig
-from .db import DRIVERS, connect
+from .db import DRIVERS, connect, resolve_driver
 
 TARGET_ROWS_PER_SEC = 20_000
 
@@ -41,7 +41,12 @@ def build_query(table: str, columns: str, limit: int) -> str:
 
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Stream rows from MySQL and measure throughput.")
-    ap.add_argument("--driver", default="pymysql", choices=DRIVERS)
+    ap.add_argument(
+        "--driver",
+        default="auto",
+        choices=["auto", *DRIVERS],
+        help="auto = mysqlclient if available, else pymysql (default: auto)",
+    )
     ap.add_argument("--table", default=TABLE)
     ap.add_argument("--columns", default="*", help="columns to SELECT (default: *)")
     ap.add_argument("--limit", type=int, default=0, help="max rows; 0 = all")
@@ -108,6 +113,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=True,
         help="DROP+recreate the Snowflake target table before loading (default: on)",
     )
+    ap.add_argument(
+        "--sf-create",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="CREATE IF NOT EXISTS the Snowflake warehouse/database/schema (default: on)",
+    )
+    ap.add_argument(
+        "--sf-pipeline",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="load on a background thread, overlapping extract+load (default: on)",
+    )
+    ap.add_argument(
+        "--sf-queue-depth",
+        type=int,
+        default=2,
+        help="max in-flight Snowflake load batches when pipelining (default: 2)",
+    )
     return ap.parse_args(argv)
 
 
@@ -121,11 +144,14 @@ def make_target(args, columns, worker_idx: int | None = None):
 
         sf = SnowflakeConfig.from_env()
         return SnowflakeTarget(
-            sf.connect_kwargs(),
+            sf,
             args.sf_table or args.table,
             columns,
             args.sf_batch,
             args.sf_recreate,
+            args.sf_create,
+            args.sf_pipeline,
+            args.sf_queue_depth,
         )
     from .targets import DiscardTarget
 
@@ -177,6 +203,7 @@ def run_single(args, cfg) -> float:
 
     rows = 0
     first_row_s = None  # time from execute() to the first batch arriving
+    setup_s = 0.0  # time to build the target (e.g. Snowflake connect + provision)
     target = None
     t0 = time.perf_counter()
     last_t, last_rows = t0, 0
@@ -185,7 +212,9 @@ def run_single(args, cfg) -> float:
         cur.arraysize = args.batch
         cur.execute(query)
         columns = [d[0] for d in cur.description]
+        t_setup0 = time.perf_counter()
         target = make_target(args, columns)
+        setup_s = time.perf_counter() - t_setup0
         while True:
             chunk = cur.fetchmany(args.batch)
             if not chunk:
@@ -221,11 +250,22 @@ def run_single(args, cfg) -> float:
     print(f"throughput:     {rps:,.0f} rows/s  (transfer-only {transfer_rps:,.0f} rows/s)", file=sys.stderr)
     if args.target == "snowflake":
         loaded = getattr(target, "rows_loaded", rows)
+        load_s = getattr(target, "load_seconds", 0.0)
+        pipelined = getattr(target, "pipelined", False)
         print(
-            f"snowflake:      loaded {loaded:,} rows into {args.sf_table or args.table}  "
-            f"(extract+load end-to-end, serialised)",
+            f"snowflake:      loaded {loaded:,} rows into {args.sf_table or args.table}"
+            f"  ({'pipelined' if pipelined else 'serialised'} extract+load)",
             file=sys.stderr,
         )
+        print(f"  setup (connect+provision): {setup_s * 1000:,.0f}ms", file=sys.stderr)
+        if pipelined:
+            print(f"  load (COPY, overlapped):   {load_s:.2f}s  (ran concurrently with extract)", file=sys.stderr)
+        else:
+            extract_s = max(0.0, dt - setup_s - load_s)
+            print(f"  extract (mysql read):      {extract_s:.2f}s", file=sys.stderr)
+            print(f"  load (snowflake COPY):     {load_s:.2f}s   <- serialised after extract", file=sys.stderr)
+        if load_s:
+            print(f"  load-only rate:            {loaded / load_s:,.0f} rows/s", file=sys.stderr)
     elif getattr(target, "bytes_out", 0):
         mb = target.bytes_out / (1 << 20)
         print(f"data out:       {mb:,.1f} MB  ({mb / dt:,.1f} MB/s)", file=sys.stderr)
@@ -323,6 +363,7 @@ def run_parallel(args, cfg) -> float:
 def main(argv=None) -> int:
     args = parse_args(argv)
     cfg = DbConfig.from_env()
+    args.driver = resolve_driver(args.driver)  # 'auto' -> mysqlclient or pymysql
 
     if args.probe:
         conn, _ = connect(cfg, args.driver, compress=args.compress)

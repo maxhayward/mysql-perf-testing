@@ -8,9 +8,12 @@ Proof-of-concept: how fast can we stream rows out of MySQL? Target: **20,000 row
   is well within reach.
 - **MySQL 8.4 in Docker** — self-contained, tuned to keep the working set in RAM so
   we measure streaming, not disk.
-- **`PyMySQL` driver with `SSCursor`** (server-side, *unbuffered* cursor) — rows stream
-  off the socket as we read them instead of buffering the whole result set in memory.
-  An optional faster C driver (`mysqlclient`) is wired in behind `--driver mysqlclient`.
+- **`mysqlclient` driver by default** (C extension, ~2× faster row parsing), with
+  **`PyMySQL`** (pure Python) as an automatic fallback where the C build isn't available —
+  controlled by `--driver auto` (the default). Both use `SSCursor` (server-side,
+  *unbuffered* cursor) so rows stream off the socket instead of buffering the whole
+  result set. mysqlclient is a core dependency, so `uv sync` always installs and keeps it
+  (needs libmysqlclient: `brew install mysql-client pkg-config`, or the mise `mysql` tool).
 
 The three levers that actually move throughput: an **unbuffered cursor**, **batched
 `fetchmany`**, and **minimal per-row work**.
@@ -19,7 +22,7 @@ The three levers that actually move throughput: an **unbuffered cursor**, **batc
 
 ```bash
 mise install          # python 3.13 + uv
-mise run install      # uv sync (installs PyMySQL)
+mise run install      # uv sync (installs mysqlclient + PyMySQL)
 mise run db-up        # start MySQL 8.4, wait until healthy
 mise run seed         # load 1,000,000 synthetic rows (ROWS=N to change)
 mise run bench        # stream all rows -> /dev/null, report rows/s
@@ -31,8 +34,8 @@ mise run bench        # stream all rows -> /dev/null, report rows/s
 # Raw read ceiling (count rows, no serialisation/output):
 uv run python -m mysql_perf.benchmark --sink none
 
-# Try the faster C driver (needs: brew install mysql-client pkg-config; uv sync --extra fast):
-uv run python -m mysql_perf.benchmark --driver mysqlclient
+# Force the pure-Python driver (mysqlclient is the default via --driver auto):
+uv run python -m mysql_perf.benchmark --driver pymysql
 
 # Limit rows, change fetch batch, select specific columns:
 uv run python -m mysql_perf.benchmark --limit 500000 --batch 20000 --columns "id,email,score"
@@ -49,7 +52,7 @@ uv run python -m mysql_perf.benchmark --driver mysqlclient --parallel 8 --sink n
 uv run python -m mysql_perf.benchmark --probe 50
 ```
 
-Flags: `--driver {pymysql,mysqlclient}` · `--table` · `--columns` · `--limit` (0 = all) ·
+Flags: `--driver {auto,pymysql,mysqlclient}` (default auto) · `--table` · `--columns` · `--limit` (0 = all) ·
 `--batch` (fetchmany size) · `--sink {/dev/null|none|-|PATH}` · `--compress` (mysqlclient) ·
 `--repeat N` · `--parallel N` · `--shard-key` · `--probe N` · `--progress-every N`.
 
@@ -81,7 +84,7 @@ background thread is the obvious next step if load time dominates.
 ```
 docker-compose.yml      MySQL 8.4, tuned for hot in-memory reads
 .mise.toml              python/uv tooling + tasks (db-up, seed, bench, ...)
-pyproject.toml          deps (PyMySQL; extras: 'fast'=mysqlclient, 'snowflake')
+pyproject.toml          deps (mysqlclient + PyMySQL; extra: 'snowflake')
 mysql_perf/
   config.py             MySQL + Snowflake config from env
   db.py                 driver abstraction -> (connection, SSCursor)

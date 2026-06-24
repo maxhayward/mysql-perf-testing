@@ -13,7 +13,10 @@ extraction loop.
 
 from __future__ import annotations
 
+import queue
 import sys
+import threading
+import time
 from typing import Protocol, Sequence
 
 
@@ -77,13 +80,14 @@ class SnowflakeTarget:
     Row-by-row INSERTs are deliberately avoided — they are orders of magnitude
     slower on a columnar warehouse.
 
-    NB: extraction and loading are serialised in this first cut (a flush blocks
-    the read loop), so the reported rate is genuine end-to-end extract+load.
-    Pipelining the two (load on a background thread/queue) is the obvious next
-    step if load time dominates.
+    By default the load runs on a background thread (pipeline=True): the main
+    thread keeps extracting from MySQL while the loader COPYs, so end-to-end time
+    approaches max(extract, load) instead of their sum. A bounded queue applies
+    backpressure to cap memory. Set pipeline=False for the simpler serialised
+    path (a flush blocks the read loop).
     """
 
-    def __init__(self, connect_kwargs: dict, table: str, columns: Sequence[str], batch_rows: int, recreate: bool):
+    def __init__(self, sf, table: str, columns: Sequence[str], batch_rows: int, recreate: bool, create_context: bool = True, pipeline: bool = True, queue_depth: int = 2):
         try:
             import snowflake.connector  # noqa: F401
             from snowflake.connector.pandas_tools import write_pandas  # noqa: F401
@@ -97,44 +101,113 @@ class SnowflakeTarget:
 
         self.bytes_out = 0  # not meaningful for the COPY path; rows_loaded is the metric
         self.rows_loaded = 0
+        self.load_seconds = 0.0  # cumulative time spent in write_pandas (stage + COPY)
+        self.database = sf.database
+        self.schema = sf.schema
         self.table = table
         self.columns = list(columns)
         self.batch_rows = batch_rows
         self._buf: list[tuple] = []
         self._created = False
-        self.conn = snowflake.connector.connect(**connect_kwargs)
-        if recreate:
-            with self.conn.cursor() as cur:
-                cur.execute(f'DROP TABLE IF EXISTS "{table}"')
-        # The table is auto-created from the DataFrame on the first flush.
+        self.conn = snowflake.connector.connect(**sf.connect_kwargs())
+
+        # Establish session context. Don't assume the landing area exists: a load
+        # test should provision its own warehouse/database/schema. Names aren't
+        # quoted, so Snowflake applies its normal upper-casing (matches the
+        # unquoted table that write_pandas creates).
+        with self.conn.cursor() as cur:
+            if create_context:
+                cur.execute(
+                    f"CREATE WAREHOUSE IF NOT EXISTS {sf.warehouse} "
+                    "WAREHOUSE_SIZE=XSMALL AUTO_SUSPEND=60 AUTO_RESUME=TRUE "
+                    "INITIALLY_SUSPENDED=FALSE"
+                )
+                cur.execute(f"CREATE DATABASE IF NOT EXISTS {sf.database}")
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {sf.database}.{sf.schema}")
+                print(
+                    f"snowflake: ensured warehouse {sf.warehouse}, database "
+                    f"{sf.database}, schema {sf.schema}",
+                    file=sys.stderr,
+                )
+            cur.execute(f"USE WAREHOUSE {sf.warehouse}")
+            cur.execute(f"USE DATABASE {sf.database}")
+            cur.execute(f"USE SCHEMA {sf.schema}")
+            if recreate:
+                cur.execute(f"DROP TABLE IF EXISTS {table}")
+        # The table is auto-created from the DataFrame on the first load.
+
+        # Pipeline: a background thread runs the COPY loads while the main thread
+        # keeps extracting, so total time approaches max(extract, load) rather
+        # than their sum. The bounded queue applies backpressure to cap memory.
+        self.pipelined = pipeline
+        self._error: Exception | None = None
+        self._queue: queue.Queue | None = None
+        self._loader: threading.Thread | None = None
+        if pipeline:
+            self._queue = queue.Queue(maxsize=max(1, queue_depth))
+            self._loader = threading.Thread(target=self._loader_loop, name="sf-loader", daemon=True)
+            self._loader.start()
 
     def write_batch(self, rows: Sequence[tuple]) -> None:
         self._buf.extend(rows)
         if len(self._buf) >= self.batch_rows:
-            self._flush()
+            self._dispatch()
 
-    def _flush(self) -> None:
+    def _dispatch(self) -> None:
+        """Hand the buffered rows off to be loaded (queued, or inline if serial)."""
         if not self._buf:
             return
+        batch = self._buf
+        self._buf = []
+        if self.pipelined:
+            if self._error:  # loader already failed; stop feeding it
+                raise self._error
+            self._queue.put(batch)  # blocks when the loader is behind (backpressure)
+        else:
+            self._load(batch)
+
+    def _loader_loop(self) -> None:
+        """Background consumer: COPY each queued batch into Snowflake."""
+        while True:
+            batch = self._queue.get()
+            try:
+                if batch is None:  # shutdown sentinel
+                    return
+                if self._error is None:
+                    self._load(batch)
+            except Exception as exc:  # capture; re-raised on the main thread
+                self._error = exc
+            finally:
+                self._queue.task_done()
+
+    def _load(self, batch: list) -> None:
         import pandas as pd
         from snowflake.connector.pandas_tools import write_pandas
 
-        df = pd.DataFrame(self._buf, columns=self.columns)
+        df = pd.DataFrame(batch, columns=self.columns)
+        t = time.perf_counter()
         success, _chunks, nrows, _output = write_pandas(
             self.conn,
             df,
             self.table,
+            database=self.database,
+            schema=self.schema,
             auto_create_table=not self._created,
             quote_identifiers=False,
         )
+        self.load_seconds += time.perf_counter() - t
         if not success:
             raise RuntimeError(f"write_pandas failed loading into {self.table}")
         self._created = True
         self.rows_loaded += nrows
-        self._buf.clear()
 
     def close(self) -> None:
         try:
-            self._flush()
+            self._dispatch()  # hand off any remaining rows
+            if self.pipelined:
+                self._queue.put(None)  # tell the loader to stop
+                self._loader.join()
+            if self._error:
+                raise self._error
         finally:
             self.conn.close()

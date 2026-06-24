@@ -18,6 +18,31 @@ from .config import DbConfig
 DRIVERS = ("pymysql", "mysqlclient")
 
 
+def resolve_driver(driver: str) -> str:
+    """Resolve 'auto' to mysqlclient when it's importable, else pymysql.
+
+    Defaulting to 'auto' gives the faster C driver wherever it's installed, while
+    keeping a zero-dependency pure-Python fallback for environments where the
+    mysqlclient build isn't available.
+    """
+    if driver != "auto":
+        return driver
+    try:
+        import MySQLdb  # noqa: F401
+
+        return "mysqlclient"
+    except ImportError:
+        import sys
+
+        print(
+            "note: mysqlclient C extension not importable, falling back to pymysql "
+            "(slower). Ensure libmysqlclient is installed (macOS: brew install "
+            "mysql-client pkg-config) and re-run: uv sync",
+            file=sys.stderr,
+        )
+        return "pymysql"
+
+
 def connect(cfg: DbConfig, driver: str, compress: bool = False) -> tuple[Any, type]:
     """Open a connection and return ``(connection, SSCursorClass)``.
 
