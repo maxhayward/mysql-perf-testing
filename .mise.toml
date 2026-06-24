@@ -1,4 +1,5 @@
 [tools]
+mysql = "latest"
 python = "3.13"
 uv = "latest"
 

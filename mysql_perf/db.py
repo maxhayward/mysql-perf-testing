@@ -18,12 +18,20 @@ from .config import DbConfig
 DRIVERS = ("pymysql", "mysqlclient")
 
 
-def connect(cfg: DbConfig, driver: str) -> tuple[Any, type]:
-    """Open a connection and return ``(connection, SSCursorClass)``."""
+def connect(cfg: DbConfig, driver: str, compress: bool = False) -> tuple[Any, type]:
+    """Open a connection and return ``(connection, SSCursorClass)``.
+
+    ``compress`` enables MySQL protocol compression (zlib). On a bandwidth-
+    limited WAN link this trades client/server CPU for fewer bytes on the wire,
+    which can raise effective row throughput — but only if the data actually
+    compresses (random/high-entropy columns won't benefit).
+    """
     if driver == "pymysql":
         import pymysql
         import pymysql.cursors
 
+        if compress:
+            raise ValueError("--compress is only supported with --driver mysqlclient")
         conn = pymysql.connect(
             host=cfg.host,
             port=cfg.port,
@@ -38,7 +46,7 @@ def connect(cfg: DbConfig, driver: str) -> tuple[Any, type]:
         import MySQLdb
         import MySQLdb.cursors
 
-        conn = MySQLdb.connect(
+        kwargs = dict(
             host=cfg.host,
             port=cfg.port,
             user=cfg.user,
@@ -46,6 +54,13 @@ def connect(cfg: DbConfig, driver: str) -> tuple[Any, type]:
             db=cfg.database,
             charset="utf8mb4",
         )
+        # Footgun: mysqlclient uses -1 as the "unset" sentinel for `compress`,
+        # so passing compress=False (-> 0, which is != -1) actually ENABLES
+        # compression. Only pass the kwarg when we truly want it on; otherwise
+        # omit it entirely so the connection stays uncompressed.
+        if compress:
+            kwargs["compress"] = True
+        conn = MySQLdb.connect(**kwargs)
         return conn, MySQLdb.cursors.SSCursor
 
     raise ValueError(f"unknown driver {driver!r}; choose one of {DRIVERS}")
