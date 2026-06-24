@@ -1,0 +1,20 @@
+[project]
+name = "mysql-perf"
+version = "0.1.0"
+description = "Proof-of-concept: how fast can we stream rows out of MySQL?"
+requires-python = ">=3.12"
+dependencies = [
+    # Pure-Python driver: zero system dependencies, works everywhere.
+    # Provides SSCursor (server-side / unbuffered streaming cursor).
+    "PyMySQL>=1.1.1",
+]
+
+[project.optional-dependencies]
+# Faster C-based driver. Needs libmysqlclient at build time
+# (macOS: `brew install mysql-client pkg-config`). Install with:
+#   uv sync --extra fast
+fast = ["mysqlclient>=2.2.4"]
+
+[tool.uv]
+# This is an app, not a library to be built/installed.
+package = false

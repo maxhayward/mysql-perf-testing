@@ -1,0 +1,31 @@
+[tools]
+python = "3.13"
+uv = "latest"
+
+[env]
+# Load connection overrides from .env if present (defaults live in config.py).
+_.file = ".env"
+
+[tasks.db-up]
+description = "Start MySQL in Docker and wait until healthy"
+run = "docker compose up -d --wait"
+
+[tasks.db-down]
+description = "Stop MySQL (keeps data volume)"
+run = "docker compose down"
+
+[tasks.db-reset]
+description = "Wipe and recreate the MySQL container + data volume"
+run = "docker compose down -v && docker compose up -d --wait"
+
+[tasks.install]
+description = "Sync Python dependencies into the uv venv"
+run = "uv sync"
+
+[tasks.seed]
+description = "Seed synthetic rows (override count with ROWS=...)"
+run = "uv run python -m mysql_perf.seed"
+
+[tasks.bench]
+description = "Run the streaming SELECT benchmark (pass flags after --)"
+run = "uv run python -m mysql_perf.benchmark"

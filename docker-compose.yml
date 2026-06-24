@@ -1,0 +1,31 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: mysqlperf
+    command:
+      # Keep the working set hot in RAM so the benchmark measures streaming,
+      # not disk seeks. ~1M synthetic rows fit comfortably in 1G.
+      - --innodb-buffer-pool-size=1G
+      # Large packets so big multi-row INSERTs during seeding aren't chunked.
+      - --max-allowed-packet=256M
+      # No binlog: cuts write overhead while seeding (this is a throwaway DB).
+      - --skip-log-bin
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: bench
+      MYSQL_USER: bench
+      MYSQL_PASSWORD: benchpw
+    ports:
+      # Host 3307 -> container 3306, to avoid clashing with any local MySQL.
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+volumes:
+  mysql-data:
